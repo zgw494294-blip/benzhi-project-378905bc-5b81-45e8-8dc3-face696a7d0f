@@ -20,15 +20,90 @@ type Service struct{ Store *storage.Store }
 func New(s *storage.Store) *Service { return &Service{Store: s} }
 func now() time.Time                { return time.Now().UTC() }
 func newID() string                 { b := make([]byte, 16); _, _ = rand.Read(b); return hex.EncodeToString(b) }
-func idem(s *Service, k string) (any, bool) {
-	if k == "" {
-		return nil, false
-	}
-	return s.Store.CheckIdempotency(k)
+
+// idemKind tags a remembered idempotency value with the operation that produced
+// it. Two distinct operations that happen to use the same Go type for their
+// result (for example CreateBatch and ReviseBatch both store a CorpusBatch) must
+// still be distinguishable so that reusing a key across endpoints reports a
+// conflict rather than silently replaying an unrelated result.
+type idemKind string
+
+const (
+	idemCreateBatch    idemKind = "create_batch"
+	idemReviseBatch    idemKind = "revise_batch"
+	idemRegisterSeg    idemKind = "register_segment"
+	idemSubmitAnnot    idemKind = "submit_annotation"
+	idemRecordReview   idemKind = "record_review"
+	idemRecheckBatch   idemKind = "recheck_batch"
+	idemFreeze         idemKind = "freeze"
+)
+
+// idemEntry is the tagged wrapper stored in the idempotency cache.
+type idemEntry struct {
+	Kind  idemKind
+	Value any
 }
+
+// ErrIdempotencyConflict is returned when an idempotency key was previously
+// remembered for a different operation. Reusing the same key across distinct
+// endpoints represents a client-side conflict rather than a replay, so it is
+// reported as a stable error instead of crashing the request with a Go type
+// assertion panic.
+var ErrIdempotencyConflict = errors.New("幂等键已用于其他操作，请使用新的幂等键")
+
+// idem returns the stored entry for an idempotency key when present.
+func idem(s *Service, k string) (idemEntry, bool) {
+	if k == "" {
+		return idemEntry{}, false
+	}
+	raw, ok := s.Store.CheckIdempotency(k)
+	if !ok {
+		return idemEntry{}, false
+	}
+	entry, match := raw.(idemEntry)
+	if !match {
+		// Legacy untagged value from before the typed cache: treat any reuse as a
+		// conflict so callers never hit a raw type assertion panic.
+		return idemEntry{Kind: "", Value: raw}, true
+	}
+	return entry, true
+}
+
+// idemGet performs a type-safe idempotency lookup. When the key was remembered
+// before by the same operation with a value of the expected type, the value is
+// returned as a replay (ok=true). When the key is remembered by a different
+// operation (or a different type), a conflict is reported (conflict=true). When
+// the key is absent, the caller proceeds with the create path (ok=false,
+// conflict=false).
+func idemGet[T any](s *Service, kind idemKind, k string) (v T, ok, conflict bool) {
+	entry, hit := idem(s, k)
+	if !hit {
+		var zero T
+		return zero, false, false
+	}
+	if entry.Kind != kind {
+		var zero T
+		return zero, false, true
+	}
+	got, match := entry.Value.(T)
+	if !match {
+		var zero T
+		return zero, false, true
+	}
+	return got, true, false
+}
+
+// remember stores a typed result under the idempotency key, tagged with the
+// operation kind so future lookups can distinguish replays from conflicts.
+func remember(s *Service, kind idemKind, k string, v any) {
+	s.Store.Remember(k, idemEntry{Kind: kind, Value: v})
+}
+
 func (s *Service) CreateBatch(d, l, c, p, k string) (domain.CorpusBatch, error) {
-	if v, ok := idem(s, k); ok {
-		return v.(domain.CorpusBatch), nil
+	if v, ok, conflict := idemGet[domain.CorpusBatch](s, idemCreateBatch, k); conflict {
+		return domain.CorpusBatch{}, ErrIdempotencyConflict
+	} else if ok {
+		return v, nil
 	}
 	b, e := domain.NewBatch(newID(), d, l, c, p, now())
 	if e != nil {
@@ -36,7 +111,7 @@ func (s *Service) CreateBatch(d, l, c, p, k string) (domain.CorpusBatch, error) 
 	}
 	e = s.Store.PutBatch(b, domain.EventBatchCreated)
 	if e == nil {
-		s.Store.Remember(k, b)
+		remember(s, idemCreateBatch, k, b)
 	}
 	return b, e
 }
@@ -49,8 +124,10 @@ func (s *Service) GetBatch(id string) (domain.CorpusBatch, error) {
 }
 func (s *Service) ListBatches() []domain.CorpusBatch { return s.Store.ListBatches() }
 func (s *Service) ReviseBatch(id, d, l, c, p string, expected int64, k string) (domain.CorpusBatch, error) {
-	if v, ok := idem(s, k); ok {
-		return v.(domain.CorpusBatch), nil
+	if v, ok, conflict := idemGet[domain.CorpusBatch](s, idemReviseBatch, k); conflict {
+		return domain.CorpusBatch{}, ErrIdempotencyConflict
+	} else if ok {
+		return v, nil
 	}
 	b, e := s.GetBatch(id)
 	if e != nil {
@@ -61,7 +138,7 @@ func (s *Service) ReviseBatch(id, d, l, c, p string, expected int64, k string) (
 	}
 	e = s.Store.PutBatch(b, domain.EventBatchRevised)
 	if e == nil {
-		s.Store.Remember(k, b)
+		remember(s, idemReviseBatch, k, b)
 	}
 	return b, e
 }
@@ -95,9 +172,10 @@ func (s *Service) RegisterSegment(batchID, speaker string, duration int64, rate,
 	return s.RegisterSegmentAt(batchID, speaker, time.Time{}, duration, rate, ch, digest, consent, expected, key)
 }
 func (s *Service) RegisterSegmentAt(batchID, speaker string, started time.Time, duration int64, rate, ch int, digest string, consent domain.ConsentState, expected int64, key string) (domain.RecordingSegment, quality.Result, error) {
-	if v, ok := idem(s, key); ok {
-		r := v.(segmentResult)
-		return r.S, r.Q, nil
+	if v, ok, conflict := idemGet[segmentResult](s, idemRegisterSeg, key); conflict {
+		return domain.RecordingSegment{}, quality.Result{}, ErrIdempotencyConflict
+	} else if ok {
+		return v.S, v.Q, nil
 	}
 	b, e := s.GetBatch(batchID)
 	if e != nil {
@@ -145,7 +223,7 @@ func (s *Service) RegisterSegmentAt(batchID, speaker string, started time.Time, 
 	}
 	_ = s.Store.PutBatch(b, domain.EventSegmentRegistered)
 	r := segmentResult{seg, q}
-	s.Store.Remember(key, r)
+	remember(s, idemRegisterSeg, key, r)
 	return seg, q, nil
 }
 
@@ -155,9 +233,10 @@ type annotationResult struct {
 }
 
 func (s *Service) SubmitAnnotation(a domain.TranscriptAnnotation, expected int64, key string) (domain.TranscriptAnnotation, quality.Result, error) {
-	if v, ok := idem(s, key); ok {
-		r := v.(annotationResult)
-		return r.A, r.Q, nil
+	if v, ok, conflict := idemGet[annotationResult](s, idemSubmitAnnot, key); conflict {
+		return domain.TranscriptAnnotation{}, quality.Result{}, ErrIdempotencyConflict
+	} else if ok {
+		return v.A, v.Q, nil
 	}
 	seg, ok := s.Store.GetSegment(a.SegmentID)
 	if !ok {
@@ -204,13 +283,15 @@ func (s *Service) SubmitAnnotation(a domain.TranscriptAnnotation, expected int64
 	}
 	_ = s.Store.PutBatch(b, domain.EventAnnotationRevised)
 	r := annotationResult{a, q}
-	s.Store.Remember(key, r)
+	remember(s, idemSubmitAnnot, key, r)
 	return a, q, nil
 }
 
 func (s *Service) RecordReview(r domain.ReviewDecision, expected int64, key string) (domain.ReviewDecision, error) {
-	if v, ok := idem(s, key); ok {
-		return v.(domain.ReviewDecision), nil
+	if v, ok, conflict := idemGet[domain.ReviewDecision](s, idemRecordReview, key); conflict {
+		return domain.ReviewDecision{}, ErrIdempotencyConflict
+	} else if ok {
+		return v, nil
 	}
 	b, e := s.GetBatch(r.BatchID)
 	if e != nil {
@@ -283,7 +364,7 @@ func (s *Service) RecordReview(r domain.ReviewDecision, expected int64, key stri
 		b.Status = domain.StatusInReview
 	}
 	_ = s.Store.PutBatch(b, domain.EventFindingUpdated)
-	s.Store.Remember(key, r)
+	remember(s, idemRecordReview, key, r)
 	return r, nil
 }
 
@@ -298,8 +379,10 @@ type QualityReport struct {
 }
 
 func (s *Service) RecheckBatch(id string, expected int64, key string) (QualityReport, error) {
-	if v, ok := idem(s, key); ok {
-		return v.(QualityReport), nil
+	if v, ok, conflict := idemGet[QualityReport](s, idemRecheckBatch, key); conflict {
+		return QualityReport{}, ErrIdempotencyConflict
+	} else if ok {
+		return v, nil
 	}
 	b, e := s.GetBatch(id)
 	if e != nil {
@@ -358,7 +441,7 @@ func (s *Service) RecheckBatch(id string, expected int64, key string) (QualityRe
 	}
 	e = s.Store.PutQualityRecord(storage.QualityRecord{BatchID: id, Version: r.Version, Status: r.Status, Issues: issueValues, CheckedAt: r.CheckedAt})
 	if e == nil {
-		s.Store.Remember(key, r)
+		remember(s, idemRecheckBatch, key, r)
 	}
 	return r, e
 }
@@ -408,9 +491,10 @@ func (s *Service) Freeze(id string, expected int64, issuer, subject, key string)
 }
 
 func (s *Service) FreezeWithExpiry(id string, expected int64, issuer, subject string, expires *time.Time, key string) (domain.CitationCredential, domain.ReleaseManifest, error) {
-	if v, ok := idem(s, key); ok {
-		r := v.(freezeResult)
-		return r.C, r.M, nil
+	if v, ok, conflict := idemGet[freezeResult](s, idemFreeze, key); conflict {
+		return domain.CitationCredential{}, domain.ReleaseManifest{}, ErrIdempotencyConflict
+	} else if ok {
+		return v.C, v.M, nil
 	}
 	b, e := s.GetBatch(id)
 	if e != nil {
@@ -466,7 +550,7 @@ func (s *Service) FreezeWithExpiry(id string, expected int64, issuer, subject st
 	_ = s.Store.PutBatch(b, domain.EventBatchFrozen)
 	e = s.Store.PutCredential(c)
 	if e == nil {
-		s.Store.Remember(key, freezeResult{c, m})
+		remember(s, idemFreeze, key, freezeResult{c, m})
 	}
 	return c, m, e
 }
