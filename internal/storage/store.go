@@ -103,11 +103,11 @@ func (s *Store) load() error {
 }
 
 func (s *Store) appendEvent(typ, id string, payload any) error {
-	s.seq++
 	b, _ := json.Marshal(payload)
 	raw := append([]byte(s.prevHash), b...)
 	h := sha256.Sum256(raw)
-	ev := domain.Event{Sequence: s.seq, SchemaVersion: 1, Type: typ, AggregateID: id, Payload: payload, PrevHash: s.prevHash, Hash: hex.EncodeToString(h[:]), At: time.Now().UTC()}
+	seq := s.seq + 1
+	ev := domain.Event{Sequence: seq, SchemaVersion: 1, Type: typ, AggregateID: id, Payload: payload, PrevHash: s.prevHash, Hash: hex.EncodeToString(h[:]), At: time.Now().UTC()}
 	f, e := os.OpenFile(filepath.Join(s.dir, "events.jsonl"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if e != nil {
 		return e
@@ -117,6 +117,7 @@ func (s *Store) appendEvent(typ, id string, payload any) error {
 	if e = enc.Encode(ev); e != nil {
 		return e
 	}
+	s.seq = seq
 	s.prevHash = ev.Hash
 	s.events = append(s.events, ev)
 	return s.snapshot()
@@ -157,8 +158,11 @@ func (s *Store) Remember(key string, v any) {
 func (s *Store) PutBatch(b domain.CorpusBatch, event string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(event, b.ID, b); e != nil {
+		return e
+	}
 	s.batches[b.ID] = b
-	return s.appendEvent(event, b.ID, b)
+	return nil
 }
 func (s *Store) GetBatch(id string) (domain.CorpusBatch, bool) {
 	s.mu.Lock()
@@ -178,8 +182,11 @@ func (s *Store) ListBatches() []domain.CorpusBatch {
 func (s *Store) PutSegment(v domain.RecordingSegment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventSegmentRegistered, v.ID, v); e != nil {
+		return e
+	}
 	s.segments[v.ID] = v
-	return s.appendEvent(domain.EventSegmentRegistered, v.ID, v)
+	return nil
 }
 func (s *Store) GetSegment(id string) (domain.RecordingSegment, bool) {
 	s.mu.Lock()
@@ -201,9 +208,12 @@ func (s *Store) ListSegments(batch string) []domain.RecordingSegment {
 func (s *Store) PutAnnotation(v domain.TranscriptAnnotation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventAnnotationSubmitted, v.ID, v); e != nil {
+		return e
+	}
 	s.annotations[v.ID] = v
 	s.annotationHistory[v.ID] = append(s.annotationHistory[v.ID], v)
-	return s.appendEvent(domain.EventAnnotationSubmitted, v.ID, v)
+	return nil
 }
 func (s *Store) ListAnnotations(segment string) []domain.TranscriptAnnotation {
 	s.mu.Lock()
@@ -270,8 +280,11 @@ func (s *Store) SetAnnotationState(id string, state domain.AnnotationState) bool
 func (s *Store) PutReview(v domain.ReviewDecision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventReviewRecorded, v.ID, v); e != nil {
+		return e
+	}
 	s.reviews[v.ID] = v
-	return s.appendEvent(domain.EventReviewRecorded, v.ID, v)
+	return nil
 }
 func (s *Store) ListReviews(batch string) []domain.ReviewDecision {
 	s.mu.Lock()
@@ -287,14 +300,20 @@ func (s *Store) ListReviews(batch string) []domain.ReviewDecision {
 func (s *Store) UpdateReview(v domain.ReviewDecision) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventFindingUpdated, v.ID, v); e != nil {
+		return e
+	}
 	s.reviews[v.ID] = v
-	return s.appendEvent(domain.EventFindingUpdated, v.ID, v)
+	return nil
 }
 func (s *Store) PutCredential(v domain.CitationCredential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventCredentialIssued, v.ID, v); e != nil {
+		return e
+	}
 	s.credentials[v.ID] = v
-	return s.appendEvent(domain.EventCredentialIssued, v.ID, v)
+	return nil
 }
 func (s *Store) GetCredential(id string) (domain.CitationCredential, bool) {
 	s.mu.Lock()
@@ -317,8 +336,11 @@ func (s *Store) ListCredentials(batch string) []domain.CitationCredential {
 func (s *Store) PutManifest(m domain.ReleaseManifest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventManifestFrozen, m.Batch.ID, m); e != nil {
+		return e
+	}
 	s.manifests[m.SHA256] = m
-	return s.appendEvent(domain.EventManifestFrozen, m.Batch.ID, m)
+	return nil
 }
 func (s *Store) GetManifest(digest string) (domain.ReleaseManifest, bool) {
 	s.mu.Lock()
@@ -340,8 +362,11 @@ func (s *Store) ListManifests(batch string) []domain.ReleaseManifest {
 func (s *Store) PutQualityRecord(r QualityRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if e := s.appendEvent(domain.EventQualityChecked, r.BatchID, r); e != nil {
+		return e
+	}
 	s.qualityChecks[r.BatchID] = r
-	return s.appendEvent(domain.EventQualityChecked, r.BatchID, r)
+	return nil
 }
 func (s *Store) GetQualityRecord(batch string) (QualityRecord, bool) {
 	s.mu.Lock()
