@@ -50,6 +50,39 @@ func New(dir string) (*Store, error) {
 	return s, nil
 }
 
+// ensureMapsInitialized guarantees that every persisted collection is a
+// non-nil map after loading a snapshot. Snapshots with schemaVersion 1 are
+// considered syntactically valid even when optional collection fields are
+// absent, so json.Unmarshal leaves them nil. Without this normalization the
+// first write to any such collection panics with "assignment to entry in nil
+// map" during normal startup flows such as batch creation.
+func (s *Store) ensureMapsInitialized() {
+	if s.batches == nil {
+		s.batches = map[string]domain.CorpusBatch{}
+	}
+	if s.segments == nil {
+		s.segments = map[string]domain.RecordingSegment{}
+	}
+	if s.annotations == nil {
+		s.annotations = map[string]domain.TranscriptAnnotation{}
+	}
+	if s.annotationHistory == nil {
+		s.annotationHistory = map[string][]domain.TranscriptAnnotation{}
+	}
+	if s.reviews == nil {
+		s.reviews = map[string]domain.ReviewDecision{}
+	}
+	if s.credentials == nil {
+		s.credentials = map[string]domain.CitationCredential{}
+	}
+	if s.manifests == nil {
+		s.manifests = map[string]domain.ReleaseManifest{}
+	}
+	if s.qualityChecks == nil {
+		s.qualityChecks = map[string]QualityRecord{}
+	}
+}
+
 func (s *Store) load() error {
 	if data, e := os.ReadFile(filepath.Join(s.dir, "snapshot.json")); e == nil {
 		var snap struct {
@@ -80,6 +113,7 @@ func (s *Store) load() error {
 			if snap.QualityChecks != nil {
 				s.qualityChecks = snap.QualityChecks
 			}
+			s.ensureMapsInitialized()
 		}
 	}
 	f, e := os.Open(filepath.Join(s.dir, "events.jsonl"))
